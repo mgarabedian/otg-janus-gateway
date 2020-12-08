@@ -1206,6 +1206,7 @@ static struct janus_json_parameter create_parameters[] = {
 	{"description", JSON_STRING, 0},
 	{"role", JSON_STRING, 0},
 	{"is_private", JANUS_JSON_BOOL, 0},
+	{"mute_participants", JANUS_JSON_BOOL, 0},
 	{"allowed", JSON_ARRAY, 0},
 	{"allowed_room_leaders", JSON_ARRAY, 0},
 	{"secret", JSON_STRING, 0},
@@ -1426,6 +1427,8 @@ typedef struct janus_videoroom {
 	guint64 room_id;			/* Unique room ID (when using integers) */
 	gchar *room_id_str;			/* Unique room ID (when using strings) */
 	gchar *room_name;			/* Room description */
+	gboolean mute_participants;	/* Should the participants audio be muted. Leader can set this */
+	gboolean paused;	/* Should the participants audio be muted. Leader can set this */
 	gchar *room_secret;			/* Secret needed to manipulate (e.g., destroy) this room */
 	gchar *room_pin;			/* Password needed to join this room, if any */
 	gboolean is_private;		/* Whether this room is 'private' (as in hidden) or not */
@@ -2219,6 +2222,8 @@ int janus_videoroom_init(janus_callbacks *callback, const char *config_path) {
 			if(pin != NULL && pin->value != NULL) {
 				videoroom->room_pin = g_strdup(pin->value);
 			}
+			videoroom->mute_participants = FALSE;
+			videoroom->paused = FALSE;
 			videoroom->is_private = priv && priv->value && janus_is_true(priv->value);
 			videoroom->require_pvtid = req_pvtid && req_pvtid->value && janus_is_true(req_pvtid->value);
 			videoroom->require_e2ee = req_e2ee && req_e2ee->value && janus_is_true(req_e2ee->value);
@@ -2908,7 +2913,59 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 	json_t *root = message;
 	json_t *response = NULL;
 
-	if(!strcasecmp(request_text, "create")) {
+	if(!strcasecmp(request_text, "mute_participants")) {
+
+		response = json_object();
+		if(!session){
+			json_object_set_new(response, "error", json_string("No session exists."));
+			goto prepare_response;
+		}
+		janus_videoroom_publisher *p = janus_videoroom_session_get_publisher(session);
+		if(p == NULL){
+			json_object_set_new(response, "error", json_string("No publisher exists."));
+			goto prepare_response;
+		}
+
+		JANUS_LOG(LOG_ERR, "Publisher Role: %s", p->role);
+
+
+		if(!strcasecmp(p->role, "leader") && gateway->events_is_enabled()) {
+			//JANUS_LOG(LOG_ERR, "HERE Role:");
+			/* we need to check if the room still exists, may have been destroyed already */
+			if(p->room == NULL){
+				json_object_set_new(response, "error", json_string("No room exists."));	
+				goto prepare_response;
+			}
+
+			if(!g_atomic_int_get(&p->room->destroyed) && p->room->notify_joining) {
+				json_t *event = json_object();
+				json_object_set_new(event, "videoroom", json_string("event"));
+				json_t *mute = json_object_get(message, "mute");
+				if(mute == NULL){
+					json_object_set_new(response, "error", json_string("'mute' boolean not set."));
+					goto prepare_response;
+				}
+				if(!json_is_boolean(mute)){
+					json_object_set_new(response, "error", json_string("'mute' parameter must be a boolean."));
+					goto prepare_response;
+				}
+				int muted_value = json_boolean_value(mute);
+				p->room->mute_participants = muted_value;
+				//p->room->paused = muted_value;
+
+				json_object_set_new(event, "mute_participants", json_boolean(muted_value));
+				json_object_set_new(event, "room", string_ids ? json_string(p->room_id_str) : json_integer(p->room_id));
+				janus_videoroom_notify_participants(p, event, FALSE);
+				/* user gets deref-ed by the owner event */
+				json_decref(event);
+			}
+			json_object_set_new(response, "success", json_string("1"));	
+		}else{
+			json_object_set_new(response, "error", json_string("Unauthorized action."));	
+		}
+		//janus_videoroom_destroy_session(*session, 0);
+		goto prepare_response;
+	}else if(!strcasecmp(request_text, "create")) {
 		/* Create a new VideoRoom */
 		JANUS_LOG(LOG_VERB, "Creating a new VideoRoom room\n");
 		JANUS_VALIDATE_JSON_OBJECT(root, create_parameters,
@@ -3123,6 +3180,8 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 			description = g_strdup(roomname);
 		}
 		videoroom->room_name = description;
+		videoroom->mute_participants = FALSE;
+		videoroom->paused = FALSE;
 		videoroom->is_private = is_private ? json_is_true(is_private) : FALSE;
 		videoroom->require_pvtid = req_pvtid ? json_is_true(req_pvtid) : FALSE;
 		videoroom->require_e2ee = req_e2ee ? json_is_true(req_e2ee) : FALSE;
@@ -3731,6 +3790,7 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 				json_t *rl = json_object();
 				json_object_set_new(rl, "room", string_ids ? json_string(room->room_id_str) : json_integer(room->room_id));
 				json_object_set_new(rl, "description", json_string(room->room_name));
+				json_object_set_new(rl, "mute_participants", json_boolean(room->mute_participants));
 				json_object_set_new(rl, "pin_required", room->room_pin ? json_true() : json_false());
 				json_object_set_new(rl, "max_publishers", json_integer(room->max_publishers));
 				json_object_set_new(rl, "bitrate", json_integer(room->bitrate));
@@ -4832,7 +4892,8 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 		goto plugin_response;
 	} else if(!strcasecmp(request_text, "join") || !strcasecmp(request_text, "joinandconfigure")
 			|| !strcasecmp(request_text, "configure") || !strcasecmp(request_text, "publish") || !strcasecmp(request_text, "unpublish")
-			|| !strcasecmp(request_text, "start") || !strcasecmp(request_text, "pause") || !strcasecmp(request_text, "switch")
+			|| !strcasecmp(request_text, "start") 
+			|| !strcasecmp(request_text, "pause") || !strcasecmp(request_text, "switch")
 			|| !strcasecmp(request_text, "leave")) {
 		/* These messages are handled asynchronously */
 
@@ -4845,9 +4906,9 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 
 		return janus_plugin_result_new(JANUS_PLUGIN_OK_WAIT, NULL, NULL);
 	} else {
-		JANUS_LOG(LOG_VERB, "Unknown request '%s'\n", request_text);
+		JANUS_LOG(LOG_VERB, "Unknown request 3 '%s'\n", request_text);
 		error_code = JANUS_VIDEOROOM_ERROR_INVALID_REQUEST;
-		g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
+		g_snprintf(error_cause, 512, "Unknown request 3 '%s'", request_text);
 	}
 
 plugin_response:
@@ -4894,9 +4955,9 @@ json_t *janus_videoroom_handle_admin_message(json_t *message) {
 		/* We got a response, send it back */
 		goto admin_response;
 	} else {
-		JANUS_LOG(LOG_VERB, "Unknown request '%s'\n", request_text);
+		JANUS_LOG(LOG_VERB, "Unknown request 4'%s'\n", request_text);
 		error_code = JANUS_VIDEOROOM_ERROR_INVALID_REQUEST;
-		g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
+		g_snprintf(error_cause, 512, "Unknown request 4'%s'", request_text);
 	}
 
 admin_response:
@@ -5005,7 +5066,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
 	janus_videoroom_publisher *participant = janus_videoroom_session_get_publisher_nodebug(session);
 	if(participant == NULL)
 		return;
-	if(g_atomic_int_get(&participant->destroyed) || participant->kicked || participant->room == NULL) {
+	if(g_atomic_int_get(&participant->destroyed) || participant->kicked || participant->room == NULL || participant->room->paused == TRUE) {
 		janus_videoroom_publisher_dereference_nodebug(participant);
 		return;
 	}
@@ -6111,6 +6172,9 @@ static void *janus_videoroom_handler(void *data) {
 				json_object_set_new(event, "room", string_ids ? json_string(publisher->room->room_id_str) :
 					json_integer(publisher->room->room_id));
 				json_object_set_new(event, "description", json_string(publisher->room->room_name));
+				json_object_set_new(event, "mute_participants", json_boolean(publisher->room->mute_participants));
+
+				
 				json_object_set_new(event, "id", string_ids ? json_string(user_id_str) : json_integer(user_id));
 				json_object_set_new(event, "private_id", json_integer(publisher->pvt_id));
 				json_object_set_new(event, "publishers", list);
@@ -6446,6 +6510,8 @@ static void *janus_videoroom_handler(void *data) {
 				goto error;
 			}
 		} else if(session->participant_type == janus_videoroom_p_type_publisher) {
+
+
 			/* Handle this publisher */
 			participant = janus_videoroom_session_get_publisher(session);
 			if(participant == NULL) {
@@ -6467,7 +6533,7 @@ static void *janus_videoroom_handler(void *data) {
 				error_code = JANUS_VIDEOROOM_ERROR_ALREADY_JOINED;
 				g_snprintf(error_cause, 512, "Already in as a publisher on this handle");
 				goto error;
-			} else if(!strcasecmp(request_text, "configure") || !strcasecmp(request_text, "publish")) {
+			}else if(!strcasecmp(request_text, "configure") || !strcasecmp(request_text, "publish")) {
 				if(!strcasecmp(request_text, "publish") && participant->sdp) {
 					janus_refcount_decrease(&participant->ref);
 					JANUS_LOG(LOG_ERR, "Can't publish, already published\n");
@@ -6725,9 +6791,9 @@ static void *janus_videoroom_handler(void *data) {
 				//~ session->destroy = TRUE;
 			} else {
 				janus_refcount_decrease(&participant->ref);
-				JANUS_LOG(LOG_ERR, "Unknown request '%s'\n", request_text);
+				JANUS_LOG(LOG_ERR, "Unknown request 1'%s'\n", request_text);
 				error_code = JANUS_VIDEOROOM_ERROR_INVALID_REQUEST;
-				g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
+				g_snprintf(error_cause, 512, "Unknown request 1'%s'", request_text);
 				goto error;
 			}
 			janus_refcount_decrease(&participant->ref);
@@ -7182,9 +7248,9 @@ static void *janus_videoroom_handler(void *data) {
 				json_object_set_new(event, "left", json_string("ok"));
 				g_atomic_int_set(&session->started, 0);
 			} else {
-				JANUS_LOG(LOG_ERR, "Unknown request '%s'\n", request_text);
+				JANUS_LOG(LOG_ERR, "Unknown request 2'%s'\n", request_text);
 				error_code = JANUS_VIDEOROOM_ERROR_INVALID_REQUEST;
-				g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
+				g_snprintf(error_cause, 512, "Unknown request 2'%s'", request_text);
 				janus_refcount_decrease(&subscriber->ref);
 				goto error;
 			}
