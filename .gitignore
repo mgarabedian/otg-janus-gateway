@@ -32,6 +32,8 @@ Makefile.in
 /config.status
 /config.sub
 
+/recordings
+
 /*.o
 /plugins/*.o
 /plugins/*.lo
