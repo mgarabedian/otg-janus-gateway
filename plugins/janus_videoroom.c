@@ -362,7 +362,36 @@ room-<unique room ID>: {
 }
 \endverbatim
  *
-  * To get a list of the available rooms (excluded those configured or
+
+ * As an administrator, you can also forcibly mute/unmute any of the media
+ * streams sent by participants (i.e., audio, video and data streams),
+ * using the \c moderate requests. Notice that if the participant is self
+ * muted on a stream, and you unmute that stream with \c moderate, they
+ * will NOT be unmuted: you'll simply remove any moderation block
+ * that may have been enforced on the participant for that medium
+ * themselves. The \c moderate request has to be formatted as follows:
+ *
+\verbatim
+{
+	"request" : "moderate",
+	"secret" : "<room secret, mandatory if configured>",
+	"room" : <unique numeric ID of the room>,
+	"id" : <unique numeric ID of the participant to moderate>,
+	"mute_audio" : <true|false, depending on whether or not audio should be muted by the moderator>,
+	"mute_video" : <true|false, depending on whether or not video should be muted by the moderator>,
+	"mute_data" : <true|false, depending on whether or not data should be muted by the moderator>,
+}
+\endverbatim
+ *
+ * A successful request will result in a \c success response:
+ *
+\verbatim
+{
+	"videoroom" : "success",
+}
+\endverbatim
+ *
+ * To get a list of the available rooms (excluded those configured or
  * created as private rooms) you can make use of the \c list request,
  * which has to be formatted as follows:
  *
@@ -6417,7 +6446,6 @@ static void *janus_videoroom_handler(void *data) {
 				}
 				session->participant_type = janus_videoroom_p_type_publisher;
 				session->participant = publisher;
-				janus_mutex_unlock(&session->mutex);
 				/* Return a list of all available publishers (those with an SDP available, that is) */
 				json_t *list = json_array(), *attendees = NULL;
 				if(publisher->room->notify_joining)
@@ -6861,7 +6889,7 @@ static void *janus_videoroom_handler(void *data) {
 				json_t *user_audio_level_average = json_object_get(root, "audio_level_average");
 				if(audio) {
 					gboolean audio_active = json_is_true(audio);
-				if(g_atomic_int_get(&session->started) && audio_active && !participant->audio_active && !participant->audio_muted) {
+					if(g_atomic_int_get(&session->started) && audio_active && !participant->audio_active && !participant->audio_muted) {
 						/* Audio was just resumed, try resetting the RTP headers for viewers */
 						janus_mutex_lock(&participant->subscribers_mutex);
 						GSList *ps = participant->subscribers;
@@ -7895,7 +7923,7 @@ static void *janus_videoroom_handler(void *data) {
 				janus_mutex_unlock(&participant->rec_mutex);
 				/* Generate an SDP string we can offer subscribers later on */
 				char *offer_sdp = janus_sdp_write(offer);
-					if(!sdp_update || (participant->ssrc[0] == 0 && participant->rid[0] == NULL)) {
+				if(!sdp_update || (participant->ssrc[0] == 0 && participant->rid[0] == NULL)) {
 					/* Is simulcasting involved */
 					if(msg_simulcast && (participant->vcodec == JANUS_VIDEOCODEC_VP8 ||
 							participant->vcodec == JANUS_VIDEOCODEC_H264)) {
